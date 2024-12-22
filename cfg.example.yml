@@ -1,0 +1,11 @@
+postgres:
+  user: "user"
+  password: "password!"
+  db: "db"
+  host: "host"
+  port: port
+
+anticaptcha:
+  api_key: "..."
+  
+live_football_url: "..."
