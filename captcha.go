@@ -15,17 +15,24 @@ import (
 	"go.uber.org/zap"
 )
 
+// SolveCaptcha — главный метод для решения капчи (если она есть) на live-странице
 func SolveCaptcha(ctx context.Context, cfg *Config) error {
 	captchaURL, err := getCaptchaURL(ctx, cfg.LiveFootballURL)
 	if err != nil {
 		return fmt.Errorf("ошибка извлечения URL капчи: %w", err)
+	}
+	if captchaURL == "" {
+		// Если возвращаем пустую строку — возможно, капчи нет.
+		// Возвращаем nil, чтобы продолжать.
+		zap.L().Debug("Капча не обнаружена на странице")
+		return nil
 	}
 
 	captchaFile, err := downloadCaptchaImage(captchaURL)
 	if err != nil {
 		return fmt.Errorf("ошибка скачивания капчи: %w", err)
 	}
-	defer os.Remove(captchaFile)
+	defer os.Remove(captchaFile) // удаляем файл после использования
 
 	fileBytes, err := os.ReadFile(captchaFile)
 	if err != nil {
@@ -33,6 +40,7 @@ func SolveCaptcha(ctx context.Context, cfg *Config) error {
 	}
 
 	encodedCaptcha := base64.StdEncoding.EncodeToString(fileBytes)
+
 	client := resty.New()
 
 	// Создание задачи в Anti-Captcha
@@ -49,7 +57,9 @@ func SolveCaptcha(ctx context.Context, cfg *Config) error {
 		return fmt.Errorf("ошибка отправки капчи в Anti-Captcha: %w", err)
 	}
 
-	zap.L().Info("Ответ от Anti-Captcha (создание задачи)", zap.ByteString("response", res.Body()))
+	zap.L().Info("Ответ от Anti-Captcha (создание задачи)",
+		zap.ByteString("response", res.Body()),
+	)
 
 	var taskResponse struct {
 		ErrorId int    `json:"errorId"`
@@ -60,7 +70,6 @@ func SolveCaptcha(ctx context.Context, cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("ошибка разбора ответа Anti-Captcha: %w", err)
 	}
-
 	if taskResponse.ErrorId != 0 {
 		return fmt.Errorf("Anti-Captcha ошибка: %s", taskResponse.Message)
 	}
@@ -106,20 +115,26 @@ func SolveCaptcha(ctx context.Context, cfg *Config) error {
 	return nil
 }
 
+// getCaptchaURL — ищем капчу на заданном URL
 func getCaptchaURL(ctx context.Context, pageURL string) (string, error) {
 	var captchaURL string
 
 	err := chromedp.Run(ctx,
 		chromedp.Navigate(pageURL),
-		chromedp.WaitVisible(`#captcha_image`, chromedp.ByID),
+		// Подождём, вдруг капчи нет — ставим явный таймаут через chromedp.ActionFunc или контекст
+		chromedp.WaitReady("body"),
+		// Пробуем найти #captcha_image
 		chromedp.AttributeValue(`#captcha_image`, "src", &captchaURL, nil),
 	)
 	if err != nil {
-		return "", fmt.Errorf("ошибка извлечения URL капчи через chromedp: %w", err)
+		// Если элемент не найден, вернём пустую строку
+		zap.L().Debug("Капча не найдена (ошибка chromedp)", zap.Error(err))
+		return "", nil
 	}
 
+	// Если captchaURL пуст, значит капчи нет
 	if captchaURL == "" {
-		return "", fmt.Errorf("URL капчи не найден")
+		return "", nil
 	}
 
 	fullURL := "https://fon.bet/" + captchaURL
@@ -127,6 +142,7 @@ func getCaptchaURL(ctx context.Context, pageURL string) (string, error) {
 	return fullURL, nil
 }
 
+// submitCaptchaSolution — вводим капчу в форме
 func submitCaptchaSolution(ctx context.Context, solution string) error {
 	return chromedp.Run(ctx,
 		chromedp.SetValue(`#captcha_input`, solution, chromedp.ByID),
@@ -163,7 +179,7 @@ func downloadCaptchaImage(captchaURL string) (string, error) {
 		return "", fmt.Errorf("размер файла капчи слишком мал: %d байт", written)
 	}
 
-	zap.L().Info("Капча успешно загружена и сохранена в файл",
+	zap.L().Info("Капча сохранена во временный файл",
 		zap.String("file", filePath),
 		zap.Int64("size", written),
 	)
