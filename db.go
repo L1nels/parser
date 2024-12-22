@@ -8,10 +8,14 @@ import (
 	"go.uber.org/zap"
 )
 
+// ConnectToPostgres — подключение к PostgreSQL, создаём connection pool + initSchema
 func ConnectToPostgres(cfg *Config) (*pgxpool.Pool, error) {
 	connStr := fmt.Sprintf("postgres://%s:%s@%s:%d/%s",
-		cfg.PostgresUser, cfg.PostgresPassword,
-		cfg.PostgresHost, cfg.PostgresPort, cfg.PostgresDB,
+		cfg.PostgresUser,
+		cfg.PostgresPassword,
+		cfg.PostgresHost,
+		cfg.PostgresPort,
+		cfg.PostgresDB,
 	)
 
 	config, err := pgxpool.ParseConfig(connStr)
@@ -33,6 +37,7 @@ func ConnectToPostgres(cfg *Config) (*pgxpool.Pool, error) {
 	return connPool, nil
 }
 
+// initSchema — создаём (если нет) таблицу events
 func initSchema(pool *pgxpool.Pool) error {
 	schema := `
 CREATE TABLE IF NOT EXISTS events (
@@ -49,6 +54,7 @@ CREATE TABLE IF NOT EXISTS events (
 	return err
 }
 
+// SaveDataToPostgres — вставляем события в таблицу
 func SaveDataToPostgres(connPool *pgxpool.Pool, data ApiResponse) error {
 	ctx := context.Background()
 
@@ -59,14 +65,18 @@ func SaveDataToPostgres(connPool *pgxpool.Pool, data ApiResponse) error {
              ON CONFLICT (id) DO NOTHING`,
 			e.ID, e.ParentID, e.Name, e.SportID, e.StartTime, e.Place, e.Priority)
 		if err != nil {
-			zap.L().Error("Ошибка вставки события",
+			zap.L().Error("Ошибка вставки события в БД",
+				zap.Error(err),
 				zap.Int64("event_id", e.ID),
-				zap.Error(err))
-		} else {
-			// Можно использовать Debug, чтобы не засорять лог
-			zap.L().Debug("Событие успешно вставлено/обновлено",
-				zap.Int64("event_id", e.ID))
+			)
+			// Если хотим сразу прерывать сохранение всех событий при первой ошибке,
+			// можно вернуть err. Но если хотим пропускать только сбойные, оставляем continue.
+			continue
 		}
+		zap.L().Debug("Событие сохранено (или пропущено ON CONFLICT)",
+			zap.Int64("event_id", e.ID),
+		)
 	}
+
 	return nil
 }
