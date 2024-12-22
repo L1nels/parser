@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/chromedp/chromedp"
@@ -20,62 +23,123 @@ func main() {
 		zap.L().Fatal("Не удалось загрузить конфигурацию", zap.Error(err))
 	}
 
-	dbPool, err := ConnectToPostgres(cfg)
-	if err != nil {
-		zap.L().Fatal("Ошибка подключения к PostgreSQL", zap.Error(err))
+	// Попробуем несколько раз подключиться к БД (например, 5 попыток с 2с перерывами)
+	var dbPool *pgxpool.Pool
+	const maxDBRetries = 5
+	for i := 1; i <= maxDBRetries; i++ {
+		dbPool, err = ConnectToPostgres(cfg)
+		if err == nil {
+			break
+		}
+		zap.L().Error("Не удалось подключиться к БД, пробуем снова...", zap.Error(err), zap.Int("try", i))
+		time.Sleep(2 * time.Second)
+	}
+	if dbPool == nil {
+		zap.L().Fatal("Не смогли подключиться к БД после 5 попыток, завершаем работу.")
 	}
 	defer dbPool.Close()
 
+	// Chromedp контекст
 	opts := chromedp.DefaultExecAllocatorOptions[:]
-	ctx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancel()
+	ctx, cancelAllocator := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancelAllocator()
 
-	browserCtx, browserCancel := chromedp.NewContext(ctx)
-	defer browserCancel()
+	browserCtx, cancelBrowser := chromedp.NewContext(ctx)
+	defer cancelBrowser()
 
-	for {
-		if err := processIteration(browserCtx, cfg, dbPool); err != nil {
-			zap.L().Error("Ошибка в процессе итерации", zap.Error(err))
+	// Канал для graceful shutdown
+	stopChan := make(chan os.Signal, 1)
+	signal.Notify(stopChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Запускаем главный цикл в отдельной горутине
+	doneChan := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stopChan:
+				zap.L().Info("Получили сигнал на остановку, выходим из цикла парсинга.")
+				close(doneChan)
+				return
+			default:
+				// processIteration c ретраями при ошибках
+				err := runIterationWithRetries(browserCtx, cfg, dbPool)
+				if err != nil {
+					zap.L().Error("Ошибка при итерации, прекращаем работу", zap.Error(err))
+					// Если это фатальная ошибка (например, динамический хост не найден), выходим
+					close(doneChan)
+					return
+				}
+				// Задержка 200мс (или интеллектуальная логика)
+				time.Sleep(200 * time.Millisecond)
+			}
 		}
+	}()
 
-		// Добавляем задержку ~200 мс, чтобы не банили
-		time.Sleep(200 * time.Millisecond)
-	}
+	// Ждём, пока цикл не завершится
+	<-doneChan
+	zap.L().Info("Парсер завершил работу.")
 }
 
+// runIterationWithRetries — если ошибка FetchData или капчи, пробуем заново
+func runIterationWithRetries(ctx context.Context, cfg *Config, dbPool *pgxpool.Pool) error {
+	const maxRetries = 3
+
+	for i := 1; i <= maxRetries; i++ {
+		err := processIteration(ctx, cfg, dbPool)
+		if err == nil {
+			return nil // успех
+		}
+
+		zap.L().Warn("Ошибка в processIteration", zap.Error(err), zap.Int("retry", i))
+
+		// Если в error есть "динамический хост не найден" — завершаем немедленно
+		if err.Error() == "динамический хост не найден" {
+			return err // пусть внешний код фатально завершит
+		}
+
+		// Если ошибка капчи (сами решаем критерий), можно немедленно ретраить или ждать
+		// time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("превышено число ретраев (%d), не удалось завершить итерацию", maxRetries)
+}
+
+// processIteration — один проход (решаем капчу, получаем HTML, парсим, сохраняем)
 func processIteration(ctx context.Context, cfg *Config, dbPool *pgxpool.Pool) error {
-	// 1. Решаем капчу (если есть)
+	// 1. Решаем капчу
 	err := SolveCaptcha(ctx, cfg)
 	if err != nil {
-		// Если капча не найдена или ошибка, логируем, но не прерываем полностью парсинг
-		zap.L().Warn("Капча не решена / ошибка капчи", zap.Error(err))
+		// Если капча есть, но мы не смогли её решить — возвращаем ошибку
+		// => runIterationWithRetries попробует ещё раз
+		return err
 	}
 
-	// 2. Забираем HTML
+	// 2. HTML
 	htmlContent, err := GetHTML(ctx, cfg.LiveFootballURL)
 	if err != nil {
-		return fmt.Errorf("ошибка GetHTML: %w", err)
+		return err
 	}
 
-	// 3. Достаём динамический хост
+	// 3. Динамический хост
 	dynamicHost, err := GetDynamicHost(htmlContent)
 	if err != nil {
-		return fmt.Errorf("ошибка GetDynamicHost: %w", err)
+		// Если не нашли хост — завершаем
+		return err
 	}
 
-	apiURL := fmt.Sprintf("https://%s/events/list?lang=ru&scopeMarket=1600", dynamicHost)
+	apiURL := "https://" + dynamicHost + "/events/list?lang=ru&scopeMarket=1600"
 
-	// 4. Запрашиваем данные
+	// 4. Достаём данные из API
 	data, err := FetchData(apiURL)
 	if err != nil {
-		return fmt.Errorf("ошибка FetchData: %w", err)
+		return err
 	}
 
 	// 5. Сохраняем в БД
-	if err := SaveDataToPostgres(dbPool, *data); err != nil {
-		return fmt.Errorf("ошибка SaveDataToPostgres: %w", err)
+	err = SaveDataToPostgres(dbPool, *data)
+	if err != nil {
+		return err
 	}
 
-	zap.L().Debug("Итерация успешно завершена")
+	zap.L().Debug("Итерация завершена")
 	return nil
 }
