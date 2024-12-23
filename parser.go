@@ -12,7 +12,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// GetDynamicHost — ищем lineXX.bk6bba-resources.com
 func GetDynamicHost(html string) (string, error) {
 	re := regexp.MustCompile(`https://(line\d+w\.bk6bba-resources\.com)`)
 	matches := re.FindStringSubmatch(html)
@@ -22,7 +21,6 @@ func GetDynamicHost(html string) (string, error) {
 	return "", errors.New("динамический хост не найден")
 }
 
-// GetHTML — загружаем весь HTML страницы
 func GetHTML(ctx context.Context, url string) (string, error) {
 	var html string
 	err := chromedp.Run(ctx,
@@ -36,7 +34,6 @@ func GetHTML(ctx context.Context, url string) (string, error) {
 	return html, nil
 }
 
-// FetchData — запрос к API, парсим JSON в ApiResponse
 func FetchData(apiURL string) (*ApiResponse, error) {
 	resp, err := http.Get(apiURL)
 	if err != nil {
@@ -45,8 +42,8 @@ func FetchData(apiURL string) (*ApiResponse, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		zap.L().Error("Ошибка ответа API", zap.Int("status_code", resp.StatusCode))
-		return nil, fmt.Errorf("ошибка ответа API, статус %d", resp.StatusCode)
+		zap.L().Error("API вернул не 200", zap.Int("status", resp.StatusCode))
+		return nil, fmt.Errorf("api status not 200: %d", resp.StatusCode)
 	}
 
 	var result ApiResponse

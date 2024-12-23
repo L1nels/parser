@@ -3,11 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
+	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"go.uber.org/zap"
@@ -23,123 +21,95 @@ func main() {
 		zap.L().Fatal("Не удалось загрузить конфигурацию", zap.Error(err))
 	}
 
-	// Попробуем несколько раз подключиться к БД (например, 5 попыток с 2с перерывами)
-	var dbPool *pgxpool.Pool
-	const maxDBRetries = 5
-	for i := 1; i <= maxDBRetries; i++ {
-		dbPool, err = ConnectToPostgres(cfg)
-		if err == nil {
-			break
-		}
-		zap.L().Error("Не удалось подключиться к БД, пробуем снова...", zap.Error(err), zap.Int("try", i))
-		time.Sleep(2 * time.Second)
-	}
-	if dbPool == nil {
-		zap.L().Fatal("Не смогли подключиться к БД после 5 попыток, завершаем работу.")
+	dbPool, err := ConnectToPostgres(cfg)
+	if err != nil {
+		zap.L().Fatal("Ошибка подключения к БД", zap.Error(err))
 	}
 	defer dbPool.Close()
 
-	// Chromedp контекст
+	// Создаём один «большой» корневой контекст браузера
 	opts := chromedp.DefaultExecAllocatorOptions[:]
-	ctx, cancelAllocator := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancelAllocator()
+	ctx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancel()
 
-	browserCtx, cancelBrowser := chromedp.NewContext(ctx)
-	defer cancelBrowser()
+	// Внешний браузерный контекст
+	browserCtx, browserCancel := chromedp.NewContext(ctx)
+	defer browserCancel()
 
-	// Канал для graceful shutdown
-	stopChan := make(chan os.Signal, 1)
-	signal.Notify(stopChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Запускаем главный цикл в отдельной горутине
-	doneChan := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-stopChan:
-				zap.L().Info("Получили сигнал на остановку, выходим из цикла парсинга.")
-				close(doneChan)
-				return
-			default:
-				// processIteration c ретраями при ошибках
-				err := runIterationWithRetries(browserCtx, cfg, dbPool)
-				if err != nil {
-					zap.L().Error("Ошибка при итерации, прекращаем работу", zap.Error(err))
-					// Если это фатальная ошибка (например, динамический хост не найден), выходим
-					close(doneChan)
-					return
-				}
-				// Задержка 200мс (или интеллектуальная логика)
-				time.Sleep(200 * time.Millisecond)
-			}
+	// Запускаем бесконечный (или пока) цикл
+	for {
+		err := runIterationWithRetries(browserCtx, cfg, dbPool)
+		if err != nil {
+			zap.L().Error("Ошибка при итерации, прекращаем работу", zap.Error(err))
+			break
 		}
-	}()
-
-	// Ждём, пока цикл не завершится
-	<-doneChan
+		time.Sleep(200 * time.Millisecond)
+	}
 	zap.L().Info("Парсер завершил работу.")
 }
 
-// runIterationWithRetries — если ошибка FetchData или капчи, пробуем заново
+// runIterationWithRetries — если в итерации ошибка, пытаемся до 3 раз
 func runIterationWithRetries(ctx context.Context, cfg *Config, dbPool *pgxpool.Pool) error {
 	const maxRetries = 3
+	var lastErr error
 
 	for i := 1; i <= maxRetries; i++ {
 		err := processIteration(ctx, cfg, dbPool)
 		if err == nil {
-			return nil // успех
+			return nil
 		}
-
-		zap.L().Warn("Ошибка в processIteration", zap.Error(err), zap.Int("retry", i))
-
-		// Если в error есть "динамический хост не найден" — завершаем немедленно
-		if err.Error() == "динамический хост не найден" {
-			return err // пусть внешний код фатально завершит
-		}
-
-		// Если ошибка капчи (сами решаем критерий), можно немедленно ретраить или ждать
-		// time.Sleep(1 * time.Second)
+		zap.L().Warn("Ошибка в processIteration",
+			zap.Error(err),
+			zap.Int("retry", i),
+		)
+		lastErr = err
+		time.Sleep(1 * time.Second)
 	}
-	return fmt.Errorf("превышено число ретраев (%d), не удалось завершить итерацию", maxRetries)
+
+	return fmt.Errorf("превышено число ретраев (%d). последняя ошибка: %w", maxRetries, lastErr)
 }
 
-// processIteration — один проход (решаем капчу, получаем HTML, парсим, сохраняем)
-func processIteration(ctx context.Context, cfg *Config, dbPool *pgxpool.Pool) error {
-	// 1. Решаем капчу
-	err := SolveCaptcha(ctx, cfg)
-	if err != nil {
-		// Если капча есть, но мы не смогли её решить — возвращаем ошибку
-		// => runIterationWithRetries попробует ещё раз
+// processIteration — одна итерация (новый контекст, network.Enable, SolveCaptcha, парсинг)
+func processIteration(parentCtx context.Context, cfg *Config, dbPool *pgxpool.Pool) error {
+	// 1) Создаём «свежий» дочерний контекст
+	iterCtx, iterCancel := chromedp.NewContext(parentCtx)
+	defer iterCancel()
+
+	// 2) Включаем network-домен (чтобы GetCookies работал в этом контексте)
+	if err := chromedp.Run(iterCtx, network.Enable()); err != nil {
+		return fmt.Errorf("не удалось включить network в контексте: %w", err)
+	}
+
+	// 3) Решаем капчу (в iterCtx)
+	if err := SolveCaptcha(iterCtx, cfg); err != nil {
 		return err
 	}
 
-	// 2. HTML
-	htmlContent, err := GetHTML(ctx, cfg.LiveFootballURL)
+	// 4) Забираем HTML
+	htmlContent, err := GetHTML(iterCtx, cfg.LiveFootballURL)
 	if err != nil {
 		return err
 	}
 
-	// 3. Динамический хост
+	// 5) Ищем динамический хост
 	dynamicHost, err := GetDynamicHost(htmlContent)
 	if err != nil {
-		// Если не нашли хост — завершаем
 		return err
 	}
 
-	apiURL := "https://" + dynamicHost + "/events/list?lang=ru&scopeMarket=1600"
+	apiURL := fmt.Sprintf("https://%s/events/list?lang=ru&scopeMarket=1600", dynamicHost)
 
-	// 4. Достаём данные из API
+	// 6) Данные из API
 	data, err := FetchData(apiURL)
 	if err != nil {
 		return err
 	}
 
-	// 5. Сохраняем в БД
-	err = SaveDataToPostgres(dbPool, *data)
-	if err != nil {
+	// 7) Сохраняем в БД
+	if err := SaveDataToPostgres(dbPool, *data); err != nil {
 		return err
 	}
 
-	zap.L().Debug("Итерация завершена")
+	zap.L().Debug("Итерация завершена без ошибок")
 	return nil
 }

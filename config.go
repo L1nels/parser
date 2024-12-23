@@ -7,7 +7,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// Config — конечная структура для хранения настроек
 type Config struct {
 	PostgresUser     string
 	PostgresPassword string
@@ -19,25 +18,18 @@ type Config struct {
 	LiveFootballURL   string
 }
 
-// LoadConfig — читает cfg.yml (и ENV, если делать BindEnv) через viper
 func LoadConfig() (*Config, error) {
-	viper.SetConfigName("cfg") // файл называется cfg.yml
+	viper.SetConfigName("cfg") // ищет файл cfg.yml
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(".")
 
-	// Пробуем прочитать cfg.yml
 	if err := viper.ReadInConfig(); err != nil {
 		zap.L().Fatal("Не удалось прочитать cfg.yml", zap.Error(err))
 	}
 
-	// Если хотим, чтобы ENV переопределяли YAML, тут вызываем BindEnv(...)
-	// viper.BindEnv("postgres.user", "POSTGRES_USER")
-	// и т.д. — при необходимости.
-
-	// Считываем нужные поля
 	port := viper.GetInt("postgres.port")
 	if port == 0 {
-		zap.L().Fatal("POSTGRES_PORT не указан ни в cfg.yml, ни в ENV (или =0)")
+		zap.L().Fatal("POSTGRES_PORT не указан или 0")
 	}
 
 	cfg := &Config{
@@ -51,24 +43,10 @@ func LoadConfig() (*Config, error) {
 		LiveFootballURL:   viper.GetString("live_football_url"),
 	}
 
-	// Проверяем, что критичные поля не пусты
-	if cfg.PostgresUser == "" {
-		return nil, fmt.Errorf("не задан postgres.user")
-	}
-	if cfg.PostgresPassword == "" {
-		return nil, fmt.Errorf("не задан postgres.password")
-	}
-	if cfg.PostgresDB == "" {
-		return nil, fmt.Errorf("не задан postgres.db")
-	}
-	if cfg.PostgresHost == "" {
-		return nil, fmt.Errorf("не задан postgres.host")
-	}
-	if cfg.AntiCaptchaAPIKey == "" {
-		return nil, fmt.Errorf("не задан anticaptcha.api_key")
-	}
-	if cfg.LiveFootballURL == "" {
-		return nil, fmt.Errorf("не задан live_football_url")
+	// Проверяем, что все поля заполнены
+	if cfg.PostgresUser == "" || cfg.PostgresPassword == "" || cfg.PostgresDB == "" ||
+		cfg.PostgresHost == "" || cfg.AntiCaptchaAPIKey == "" || cfg.LiveFootballURL == "" {
+		return nil, fmt.Errorf("не все поля заданы в cfg.yml")
 	}
 
 	zap.L().Info("Конфигурация загружена",
